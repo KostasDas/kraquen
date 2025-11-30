@@ -24,6 +24,15 @@ impl<T: 'static> IntoIterator for Queue<T> {
         }
     }
 }
+impl<'a, T> IntoIterator for &'a Queue<T> {
+    type Item = &'a T;
+    type IntoIter = Box<dyn Iterator<Item = &'a T> + 'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 impl<T> Queue<T> {
     pub fn new(mode: QueueMode) -> Queue<T> {
         Queue {
@@ -193,5 +202,35 @@ mod tests {
         let result: Vec<&str> = queue.into_iter().collect();
 
         assert_eq!(result, vec!["b", "a"]);
+    }
+
+    #[test]
+    fn test_into_iter_reference_fifo() {
+        let mut queue = Queue::new(QueueMode::FIFO);
+        queue.push("a");
+        queue.push("b");
+        
+        let mut result = Vec::new();
+        for item in &queue {
+            result.push(item);
+        }
+        assert_eq!(result, vec![&"a", &"b"]);
+        // queue is not destroyed in this case
+        assert_eq!(2, queue.len())
+    }
+
+    #[test]
+    fn test_into_iter_reference_lifo() {
+        let mut queue = Queue::new(QueueMode::LIFO);
+        queue.push("a");
+        queue.push("b");
+
+        let mut result = Vec::new();
+        for item in &queue {
+            result.push(item);
+        }
+
+        assert_eq!(result, vec![&"b", &"a"]);
+        assert_eq!(2, queue.len())
     }
 }
