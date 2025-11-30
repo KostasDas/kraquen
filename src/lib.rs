@@ -9,6 +9,21 @@ pub struct Queue<T> {
     data: VecDeque<T>
 }
 
+impl<T: 'static> IntoIterator for Queue<T> {
+    type Item = T;
+    type IntoIter = Box<dyn Iterator<Item = T>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        match self.mode {
+            QueueMode::FIFO => {
+                Box::new(self.data.into_iter().rev())
+            }
+            QueueMode::LIFO => {
+                Box::new(self.data.into_iter())
+            }
+        }
+    }
+}
 impl<T> Queue<T> {
     pub fn new(mode: QueueMode) -> Queue<T> {
         Queue {
@@ -52,6 +67,17 @@ impl<T> Queue<T> {
     
     pub fn clear(&mut self) {
         self.data.clear()
+    }
+    
+    pub fn iter(&self) -> Box<dyn Iterator<Item = &T> + '_> {
+        match self.mode {
+            QueueMode::FIFO => {
+                Box::new(self.data.iter().rev())
+            }
+            QueueMode::LIFO => {
+                Box::new(self.data.iter())
+            }
+        }
     }
 }
 
@@ -116,5 +142,56 @@ mod tests {
         fifo.push(2);
         fifo.clear();
         assert_eq!(0, fifo.len());
+    }
+
+    #[test]
+    fn test_iter_borrow_fifo() {
+        let mut queue = Queue::new(QueueMode::FIFO);
+        queue.push(10);
+        queue.push(20);
+        queue.push(30);
+
+        let collected: Vec<&i32> = queue.iter().collect();
+        assert_eq!(collected, vec![&10, &20, &30]);
+
+        // Ensure queue is still alive (iter borrowed it)
+        assert_eq!(queue.len(), 3);
+    }
+
+    #[test]
+    fn test_iter_borrow_lifo() {
+        let mut queue = Queue::new(QueueMode::LIFO);
+        queue.push(10);
+        queue.push(20);
+        queue.push(30);
+
+        // LIFO Expectation: 30, 20, 10
+        let collected: Vec<&i32> = queue.iter().collect();
+        assert_eq!(collected, vec![&30, &20, &10]);
+    }
+
+    #[test]
+    fn test_into_iter_fifo() {
+        let mut queue = Queue::new(QueueMode::FIFO);
+        queue.push("a");
+        queue.push("b");
+
+        // Use the trait implicitly in a loop
+        let mut result = Vec::new();
+        for item in queue {
+            result.push(item);
+        }
+        assert_eq!(result, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_into_iter_lifo() {
+        let mut queue = Queue::new(QueueMode::LIFO);
+        queue.push("a");
+        queue.push("b");
+
+        let result: Vec<&str> = queue.into_iter().collect();
+
+        assert_eq!(result, vec!["b", "a"]);
     }
 }
