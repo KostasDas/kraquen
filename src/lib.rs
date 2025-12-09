@@ -1,41 +1,80 @@
 use std::collections::VecDeque;
+use std::fmt::{Debug, Formatter, Result};
+use std::sync::{Arc, Mutex};
 
-pub enum QueueMode {
-    FIFO,
-    LIFO
-}
-pub struct Queue<T> {
-    mode: QueueMode,
-    data: VecDeque<T>
+#[derive(Clone)]
+struct Queue<T> {
+    queue: Arc<Mutex<InnerQueue<T>>>
 }
 
-impl<T: 'static> IntoIterator for Queue<T> {
-    type Item = T;
-    type IntoIter = Box<dyn Iterator<Item = T>>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        match self.mode {
+impl<T: Debug> Debug for Queue<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        let guard = self.queue.lock().unwrap();
+        match guard.mode {
             QueueMode::FIFO => {
-                Box::new(self.data.into_iter().rev())
+                f.debug_list().entries(guard.data.iter().rev()).finish()
             }
             QueueMode::LIFO => {
-                Box::new(self.data.into_iter())
+                f.debug_list().entries(guard.data.iter()).finish()
             }
         }
-    }
-}
-impl<'a, T> IntoIterator for &'a Queue<T> {
-    type Item = &'a T;
-    type IntoIter = Box<dyn Iterator<Item = &'a T> + 'a>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
     }
 }
 
 impl<T> Queue<T> {
     pub fn new(mode: QueueMode) -> Queue<T> {
+        let queue = InnerQueue::new(mode);
+        let x = Mutex::new(queue);
         Queue {
+            queue: Arc::new(x)
+        }
+    }
+    
+    pub fn push(&self, item : T) {
+        let mut guard = self.queue.lock().unwrap();
+        guard.push(item);
+    }
+    
+    pub fn pop(&self) -> Option<T> {
+        let mut guard = self.queue.lock().unwrap();
+        guard.pop()
+    }
+    
+    pub fn len(&self) -> usize {
+        let guard = self.queue.lock().unwrap();
+        guard.data.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        let guard = self.queue.lock().unwrap();
+        guard.data.is_empty()
+    }
+    
+    pub fn peek<R, F>(&self, f: F) -> Option<R> 
+    where F: FnOnce(&T) -> R,
+    {
+        let guard = self.queue.lock().unwrap();
+        guard.peek().map(f)
+    }
+
+    
+    pub fn clear(&self) {
+        let mut guard = self.queue.lock().unwrap();
+        guard.data.clear();
+    }
+}
+pub enum QueueMode {
+    FIFO,
+    LIFO
+}
+struct InnerQueue<T> {
+    mode: QueueMode,
+    data: VecDeque<T>
+}
+
+impl<T> InnerQueue<T> {
+    fn new(mode: QueueMode) -> InnerQueue<T> {
+        InnerQueue {
             mode,
             data: VecDeque::new()
         }
@@ -55,14 +94,6 @@ impl<T> Queue<T> {
         }
     }
     
-    pub fn len(&self) -> usize {
-        self.data.len()
-    }
-    
-    pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
-    
     pub fn peek(&self) -> Option<&T> {
         match self.mode {
             QueueMode::FIFO => {
@@ -73,22 +104,8 @@ impl<T> Queue<T> {
             }
         }
     }
-    
-    pub fn clear(&mut self) {
-        self.data.clear()
-    }
-    
-    pub fn iter(&self) -> Box<dyn Iterator<Item = &T> + '_> {
-        match self.mode {
-            QueueMode::FIFO => {
-                Box::new(self.data.iter().rev())
-            }
-            QueueMode::LIFO => {
-                Box::new(self.data.iter())
-            }
-        }
-    }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -96,7 +113,7 @@ mod tests {
 
     #[test]
     fn test_push() {
-        let mut queue: Queue<usize> = Queue::new(QueueMode::FIFO);
+        let queue: Queue<usize> = Queue::new(QueueMode::FIFO);
         queue.push(1);
         let element = queue.pop();
         assert_eq!(1, element.unwrap());
@@ -104,7 +121,7 @@ mod tests {
     }
     #[test]
     fn test_fifo() {
-        let mut queue : Queue<usize> = Queue::new(QueueMode::FIFO);
+        let queue : Queue<usize> = Queue::new(QueueMode::FIFO);
         queue.push(1);
         queue.push(2);
         queue.push(3);
@@ -115,7 +132,7 @@ mod tests {
 
     #[test]
     fn test_lifo() {
-        let mut queue : Queue<usize> = Queue::new(QueueMode::LIFO);
+        let queue : Queue<usize> = Queue::new(QueueMode::LIFO);
         queue.push(1);
         queue.push(2);
         queue.push(3);
@@ -125,112 +142,110 @@ mod tests {
     }
     #[test]
     fn test_peek_and_len() {
-        let mut lifo : Queue<usize> = Queue::new(QueueMode::LIFO);
-        lifo.push(1);
-        lifo.push(2);
-        assert_eq!(2, *lifo.peek().unwrap());
-        assert_eq!(2, lifo.len());
+        let lifo : Queue<usize> = Queue::new(QueueMode::LIFO);
+        lifo.push(10);
+        
+        let value = lifo.peek(|v| *v).unwrap();
+        assert_eq!(value, 10);
 
-        let mut fifo : Queue<usize> = Queue::new(QueueMode::FIFO);
-        fifo.push(1);
-        fifo.push(2);
-        assert_eq!(1, *fifo.peek().unwrap());
-        assert_eq!(2, fifo.len());
+        let fifo : Queue<usize> = Queue::new(QueueMode::LIFO);
+        fifo.push(5);
+
+        let fifo_value = fifo.peek(|v| *v).unwrap();
+        assert_eq!(fifo_value, 5);
     }
-    
+
     #[test]
-    fn test_clear_and_len() {
-        let mut lifo : Queue<usize> = Queue::new(QueueMode::LIFO);
+    fn test_peek_ordering_and_clear() {
+        let lifo: Queue<usize> = Queue::new(QueueMode::LIFO);
         lifo.push(1);
         lifo.push(2);
+        lifo.push(3);
+
+        assert_eq!(3, lifo.peek(|v| *v).unwrap());
+
         lifo.clear();
         assert_eq!(0, lifo.len());
 
-        let mut fifo : Queue<usize> = Queue::new(QueueMode::FIFO);
+        let fifo: Queue<usize> = Queue::new(QueueMode::FIFO);
         fifo.push(1);
         fifo.push(2);
+        fifo.push(3);
+
+        assert_eq!(1, fifo.peek(|v| *v).unwrap());
+
         fifo.clear();
         assert_eq!(0, fifo.len());
     }
 
+    use std::thread;
     #[test]
-    fn test_iter_borrow_fifo() {
-        let mut queue = Queue::new(QueueMode::FIFO);
-        queue.push(10);
-        queue.push(20);
-        queue.push(30);
+    fn test_multithreaded_concurrent_access() {
+        // mutex provides interior mutability
+        let queue = Queue::new(QueueMode::FIFO);
+        let mut handles = vec![];
 
-        let collected: Vec<&i32> = queue.iter().collect();
-        assert_eq!(collected, vec![&10, &20, &30]);
+        for i in 0..10 {
+            // Clone the handle, cheap
+            let queue_clone = queue.clone();
 
-        // Ensure queue is still alive (iter borrowed it)
-        assert_eq!(queue.len(), 3);
-    }
-
-    #[test]
-    fn test_iter_borrow_lifo() {
-        let mut queue = Queue::new(QueueMode::LIFO);
-        queue.push(10);
-        queue.push(20);
-        queue.push(30);
-
-        // LIFO Expectation: 30, 20, 10
-        let collected: Vec<&i32> = queue.iter().collect();
-        assert_eq!(collected, vec![&30, &20, &10]);
-    }
-
-    #[test]
-    fn test_into_iter_fifo() {
-        let mut queue = Queue::new(QueueMode::FIFO);
-        queue.push("a");
-        queue.push("b");
-
-        // Use the trait implicitly in a loop
-        let mut result = Vec::new();
-        for item in queue {
-            result.push(item);
-        }
-        assert_eq!(result, vec!["a", "b"]);
-    }
-
-    #[test]
-    fn test_into_iter_lifo() {
-        let mut queue = Queue::new(QueueMode::LIFO);
-        queue.push("a");
-        queue.push("b");
-
-        let result: Vec<&str> = queue.into_iter().collect();
-
-        assert_eq!(result, vec!["b", "a"]);
-    }
-
-    #[test]
-    fn test_into_iter_reference_fifo() {
-        let mut queue = Queue::new(QueueMode::FIFO);
-        queue.push("a");
-        queue.push("b");
-        
-        let mut result = Vec::new();
-        for item in &queue {
-            result.push(item);
-        }
-        assert_eq!(result, vec![&"a", &"b"]);
-        // queue is not destroyed in this case
-        assert_eq!(2, queue.len())
-    }
-
-    #[test]
-    fn test_into_iter_reference_lifo() {
-        let mut queue = Queue::new(QueueMode::LIFO);
-        queue.push("a");
-        queue.push("b");
-
-        let mut result = Vec::new();
-        for item in &queue {
-            result.push(item);
+            handles.push(thread::spawn(move || {
+                for j in 0..100 {
+                    queue_clone.push((i * 100) + j);
+                }
+            }));
         }
 
-        assert_eq!(result, vec![&"b", &"a"]);
-        assert_eq!(2, queue.len())
+        // Wait for all threads to finish pushing
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // If the queue is thread-safe, all 1000 items (10 threads * 100 items) must be there.
+        assert_eq!(queue.len(), 1000);
+        assert!(!queue.is_empty());
+    }
+
+    #[test]
+    fn test_debug_print() {
+        let fifo = Queue::new(QueueMode::FIFO);
+        fifo.push(10);
+        fifo.push(20);
+
+        let output = format!("{:?}", fifo);
+
+        assert_eq!(output, "[10, 20]");
+
+        let lifo = Queue::new(QueueMode::LIFO);
+        lifo.push(10);
+        lifo.push(20);
+
+        let output = format!("{:?}", lifo);
+
+        assert_eq!(output, "[20, 10]");
+    }
+
+    #[test]
+    fn test_non_clone_types() {
+        // A struct that explicitly cannot be cloned
+        #[derive(Debug, PartialEq)]
+        struct UniqueItem {
+            id: i32,
+        }
+
+        let queue = Queue::new(QueueMode::FIFO);
+        queue.push(UniqueItem { id: 1 });
+        let item = queue.pop().unwrap();
+
+        assert_eq!(item, UniqueItem { id: 1 });
+    }
+
+    #[test]
+    fn test_peek_on_empty() {
+        let queue: Queue<i32> = Queue::new(QueueMode::FIFO);
+
+        let result = queue.peek(|v| *v);
+
+        assert_eq!(result, None);
     }
 }
