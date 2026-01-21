@@ -1,15 +1,15 @@
 use std::collections::VecDeque;
 use std::fmt::{Debug, Formatter, Result};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 #[derive(Clone)]
 struct Queue<T> {
-    queue: Arc<Mutex<InnerQueue<T>>>
+    queue: Arc<(Mutex<InnerQueue<T>>, Condvar)>
 }
 
 impl<T: Debug> Debug for Queue<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
-        let guard = self.queue.lock().unwrap();
+        let guard = (*self.queue).0.lock().unwrap();
         match guard.mode {
             QueueMode::FIFO => {
                 f.debug_list().entries(guard.data.iter().rev()).finish()
@@ -25,41 +25,42 @@ impl<T> Queue<T> {
     pub fn new(mode: QueueMode) -> Queue<T> {
         let queue = InnerQueue::new(mode);
         let x = Mutex::new(queue);
+        let c = Condvar::new();
         Queue {
-            queue: Arc::new(x)
+            queue: Arc::new((x, c))
         }
     }
     
     pub fn push(&self, item : T) {
-        let mut guard = self.queue.lock().unwrap();
+        let mut guard = (*self.queue).0.lock().unwrap();
         guard.push(item);
     }
-    
+
     pub fn pop(&self) -> Option<T> {
-        let mut guard = self.queue.lock().unwrap();
+        let mut guard = (*self.queue).0.lock().unwrap();
         guard.pop()
     }
     
     pub fn len(&self) -> usize {
-        let guard = self.queue.lock().unwrap();
+        let guard = (*self.queue).0.lock().unwrap();
         guard.data.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        let guard = self.queue.lock().unwrap();
+        let guard = (*self.queue).0.lock().unwrap();
         guard.data.is_empty()
     }
     
     pub fn peek<R, F>(&self, f: F) -> Option<R> 
     where F: FnOnce(&T) -> R,
     {
-        let guard = self.queue.lock().unwrap();
+        let guard = (*self.queue).0.lock().unwrap();
         guard.peek().map(f)
     }
 
     
     pub fn clear(&self) {
-        let mut guard = self.queue.lock().unwrap();
+        let mut guard = (*self.queue).0.lock().unwrap();
         guard.data.clear();
     }
 }
