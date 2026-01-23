@@ -9,7 +9,7 @@ struct Queue<T> {
 
 impl<T: Debug> Debug for Queue<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
-        let guard = (*self.queue).0.lock().unwrap();
+        let guard = self.queue.0.lock().unwrap();
         match guard.mode {
             QueueMode::FIFO => {
                 f.debug_list().entries(guard.data.iter().rev()).finish()
@@ -32,35 +32,58 @@ impl<T> Queue<T> {
     }
     
     pub fn push(&self, item : T) {
-        let mut guard = (*self.queue).0.lock().unwrap();
+        let (lock, cond) = &*self.queue;
+        let mut guard = lock.lock().unwrap();
         guard.push(item);
+        cond.notify_one();
     }
 
     pub fn pop(&self) -> Option<T> {
-        let mut guard = (*self.queue).0.lock().unwrap();
+        let mut guard = self.queue.0.lock().unwrap();
+        guard.pop()
+    }
+
+    pub fn pop_blocking(&self) -> T {
+        let (lock, cond) = &*self.queue;
+        let guard = lock.lock().unwrap();
+        let mut guard = cond
+            .wait_while(guard, |inner| inner.data.is_empty())
+            .unwrap();
+        guard.pop().unwrap()
+    }
+
+
+    pub fn pop_timeout(&self, timeout: std::time::Duration) -> Option<T> {
+        let (lock, cvar) = &*self.queue;
+        let guard = lock.lock().unwrap();
+
+        let (mut guard, _) = cvar
+            .wait_timeout_while(guard, timeout, |inner| inner.data.is_empty())
+            .unwrap();
+
         guard.pop()
     }
     
     pub fn len(&self) -> usize {
-        let guard = (*self.queue).0.lock().unwrap();
+        let guard = self.queue.0.lock().unwrap();
         guard.data.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        let guard = (*self.queue).0.lock().unwrap();
+        let guard = self.queue.0.lock().unwrap();
         guard.data.is_empty()
     }
     
     pub fn peek<R, F>(&self, f: F) -> Option<R> 
     where F: FnOnce(&T) -> R,
     {
-        let guard = (*self.queue).0.lock().unwrap();
+        let guard = self.queue.0.lock().unwrap();
         guard.peek().map(f)
     }
 
     
     pub fn clear(&self) {
-        let mut guard = (*self.queue).0.lock().unwrap();
+        let mut guard = self.queue.0.lock().unwrap();
         guard.data.clear();
     }
 }
@@ -180,6 +203,8 @@ mod tests {
     }
 
     use std::thread;
+    use std::time::Duration;
+
     #[test]
     fn test_multithreaded_concurrent_access() {
         // mutex provides interior mutability
@@ -207,6 +232,36 @@ mod tests {
         assert!(!queue.is_empty());
     }
 
+    #[test]
+    fn test_pop_blocking() {
+
+        let queue = Queue::new(QueueMode::FIFO);
+        let queue_clone = queue.clone();
+        let handle = thread::spawn( move || {
+            queue_clone.pop_blocking()
+        });
+
+        thread::sleep(Duration::from_millis(100));
+        queue.push(5);
+
+        let value = handle.join().unwrap();
+        assert_eq!(value, 5);
+    }
+    #[test]
+    fn test_pop_timeout() {
+        let queue: Queue<i32> = Queue::new(QueueMode::FIFO);
+
+        let start = std::time::Instant::now();
+        let result = queue.pop_timeout(Duration::from_millis(100));
+        let elapsed = start.elapsed();
+
+        assert_eq!(result, None);
+        assert!(elapsed >= Duration::from_millis(100));
+
+        queue.push(42);
+        let result = queue.pop_timeout(Duration::from_millis(100));
+        assert_eq!(result, Some(42));
+    }
     #[test]
     fn test_debug_print() {
         let fifo = Queue::new(QueueMode::FIFO);
