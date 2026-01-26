@@ -1,135 +1,158 @@
 use std::collections::VecDeque;
-use std::fmt::{Debug, Formatter, Result};
+use std::fmt::{Debug, Formatter};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Condvar, Mutex};
 
 #[derive(Clone)]
 struct Queue<T> {
-    queue: Arc<(Mutex<InnerQueue<T>>, Condvar)>
+    shared: Arc<SharedState<T>>,
 }
 
 impl<T: Debug> Debug for Queue<T> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
-        let guard = self.queue.0.lock().unwrap();
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let guard = self.shared.inner.lock().unwrap();
         match guard.mode {
-            QueueMode::FIFO => {
-                f.debug_list().entries(guard.data.iter().rev()).finish()
-            }
-            QueueMode::LIFO => {
-                f.debug_list().entries(guard.data.iter()).finish()
-            }
+            QueueMode::FIFO => f.debug_list().entries(guard.data.iter().rev()).finish(),
+            QueueMode::LIFO => f.debug_list().entries(guard.data.iter()).finish(),
         }
     }
 }
 
 impl<T> Queue<T> {
     pub fn new(mode: QueueMode) -> Queue<T> {
-        let queue = InnerQueue::new(mode);
-        let x = Mutex::new(queue);
-        let c = Condvar::new();
+        let state = SharedState::new(mode);
         Queue {
-            queue: Arc::new((x, c))
+            shared: Arc::new(state),
         }
     }
-    
-    pub fn push(&self, item : T) {
-        let (lock, cond) = &*self.queue;
-        let mut guard = lock.lock().unwrap();
-        guard.push(item);
-        cond.notify_one();
+
+    pub fn shutdown(&self) {
+        self.shared
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.shared.condvar.notify_all();
     }
 
+    pub fn try_push(&self, item: T) -> Result<(), T> {
+        if !self
+            .shared
+            .shutdown
+            .load(std::sync::atomic::Ordering::SeqCst) 
+        {
+            let mut guard = self.shared.inner.lock().unwrap();
+            guard.push(item);
+            self.shared.condvar.notify_one();
+            return Ok(());
+        }
+        Err(item)
+    }
+
+    pub fn push(&self, item: T) {
+        if let Err(_item_we_dont_need_to_print) = self.try_push(item) {
+            panic!("Tried to push to a shut down queue");
+        }
+    }
+
+
     pub fn pop(&self) -> Option<T> {
-        let mut guard = self.queue.0.lock().unwrap();
+        let mut guard = self.shared.inner.lock().unwrap();
         guard.pop()
     }
 
     pub fn pop_blocking(&self) -> T {
-        let (lock, cond) = &*self.queue;
-        let guard = lock.lock().unwrap();
-        let mut guard = cond
+        let guard = self.shared.inner.lock().unwrap();
+        let mut guard = self
+            .shared
+            .condvar
             .wait_while(guard, |inner| inner.data.is_empty())
             .unwrap();
         guard.pop().unwrap()
     }
 
-
     pub fn pop_timeout(&self, timeout: std::time::Duration) -> Option<T> {
-        let (lock, cvar) = &*self.queue;
-        let guard = lock.lock().unwrap();
-
-        let (mut guard, _) = cvar
+        let guard = self.shared.inner.lock().unwrap();
+        let (mut guard, _) = self
+            .shared
+            .condvar
             .wait_timeout_while(guard, timeout, |inner| inner.data.is_empty())
             .unwrap();
 
         guard.pop()
     }
-    
+
     pub fn len(&self) -> usize {
-        let guard = self.queue.0.lock().unwrap();
+        let guard = self.shared.inner.lock().unwrap();
         guard.data.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        let guard = self.queue.0.lock().unwrap();
+        let guard = self.shared.inner.lock().unwrap();
         guard.data.is_empty()
     }
-    
-    pub fn peek<R, F>(&self, f: F) -> Option<R> 
-    where F: FnOnce(&T) -> R,
+
+    pub fn peek<R, F>(&self, f: F) -> Option<R>
+    where
+        F: FnOnce(&T) -> R,
     {
-        let guard = self.queue.0.lock().unwrap();
+        let guard = self.shared.inner.lock().unwrap();
         guard.peek().map(f)
     }
 
-    
     pub fn clear(&self) {
-        let mut guard = self.queue.0.lock().unwrap();
+        let mut guard = self.shared.inner.lock().unwrap();
         guard.data.clear();
     }
 }
 pub enum QueueMode {
     FIFO,
-    LIFO
+    LIFO,
 }
 struct InnerQueue<T> {
     mode: QueueMode,
-    data: VecDeque<T>
+    data: VecDeque<T>,
 }
 
 impl<T> InnerQueue<T> {
     fn new(mode: QueueMode) -> InnerQueue<T> {
         InnerQueue {
             mode,
-            data: VecDeque::new()
+            data: VecDeque::new(),
         }
     }
-    pub fn push(&mut self, item : T) {
+    pub fn push(&mut self, item: T) {
         self.data.push_front(item)
     }
-    
+
     pub fn pop(&mut self) -> Option<T> {
-         match self.mode {
-            QueueMode::FIFO => {
-                self.data.pop_back()
-            }
-            QueueMode::LIFO => {
-                self.data.pop_front()
-            }
+        match self.mode {
+            QueueMode::FIFO => self.data.pop_back(),
+            QueueMode::LIFO => self.data.pop_front(),
         }
     }
-    
+
     pub fn peek(&self) -> Option<&T> {
         match self.mode {
-            QueueMode::FIFO => {
-                self.data.back()
-            }
-            QueueMode::LIFO => {
-                self.data.front()
-            }
+            QueueMode::FIFO => self.data.back(),
+            QueueMode::LIFO => self.data.front(),
         }
     }
 }
 
+struct SharedState<T> {
+    inner: Mutex<InnerQueue<T>>,
+    condvar: Condvar,
+    shutdown: AtomicBool,
+}
+
+impl<T> SharedState<T> {
+    pub fn new(mode: QueueMode) -> Self {
+        SharedState {
+            inner: Mutex::new(InnerQueue::new(mode)),
+            condvar: Condvar::new(),
+            shutdown: AtomicBool::new(false),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -145,7 +168,7 @@ mod tests {
     }
     #[test]
     fn test_fifo() {
-        let queue : Queue<usize> = Queue::new(QueueMode::FIFO);
+        let queue: Queue<usize> = Queue::new(QueueMode::FIFO);
         queue.push(1);
         queue.push(2);
         queue.push(3);
@@ -156,7 +179,7 @@ mod tests {
 
     #[test]
     fn test_lifo() {
-        let queue : Queue<usize> = Queue::new(QueueMode::LIFO);
+        let queue: Queue<usize> = Queue::new(QueueMode::LIFO);
         queue.push(1);
         queue.push(2);
         queue.push(3);
@@ -166,13 +189,13 @@ mod tests {
     }
     #[test]
     fn test_peek_and_len() {
-        let lifo : Queue<usize> = Queue::new(QueueMode::LIFO);
+        let lifo: Queue<usize> = Queue::new(QueueMode::LIFO);
         lifo.push(10);
-        
+
         let value = lifo.peek(|v| *v).unwrap();
         assert_eq!(value, 10);
 
-        let fifo : Queue<usize> = Queue::new(QueueMode::LIFO);
+        let fifo: Queue<usize> = Queue::new(QueueMode::LIFO);
         fifo.push(5);
 
         let fifo_value = fifo.peek(|v| *v).unwrap();
@@ -234,12 +257,9 @@ mod tests {
 
     #[test]
     fn test_pop_blocking() {
-
         let queue = Queue::new(QueueMode::FIFO);
         let queue_clone = queue.clone();
-        let handle = thread::spawn( move || {
-            queue_clone.pop_blocking()
-        });
+        let handle = thread::spawn(move || queue_clone.pop_blocking());
 
         thread::sleep(Duration::from_millis(100));
         queue.push(5);
