@@ -28,7 +28,7 @@ use std::sync::{Arc, Condvar, Mutex};
 /// assert_eq!(lifo_queue.pop(), Some(2));
 /// ```
 #[derive(Clone)]
-struct Queue<T> {
+pub struct Queue<T> {
     shared: Arc<SharedState<T>>,
 }
 
