@@ -3,6 +3,30 @@ use std::fmt::{Debug, Formatter};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Condvar, Mutex};
 
+/// A thread-safe, generic queue that can operate in either FIFO (First-In, First-Out)
+/// or LIFO (Last-In, First-Out) mode.
+///
+/// The queue is implemented using a `VecDeque` protected by a `Mutex` for interior mutability,
+/// making it safe to share across multiple threads. It also uses a `Condvar` to allow for
+/// efficient blocking waits for items.
+///
+/// # Examples
+///
+/// ```
+/// use kraquen::{Queue, QueueMode};
+///
+/// // Create a new FIFO queue
+/// let fifo_queue = Queue::new(QueueMode::FIFO);
+/// fifo_queue.push(1);
+/// fifo_queue.push(2);
+/// assert_eq!(fifo_queue.pop(), Some(1));
+///
+/// // Create a new LIFO queue
+/// let lifo_queue = Queue::new(QueueMode::LIFO);
+/// lifo_queue.push(1);
+/// lifo_queue.push(2);
+/// assert_eq!(lifo_queue.pop(), Some(2));
+/// ```
 #[derive(Clone)]
 struct Queue<T> {
     shared: Arc<SharedState<T>>,
@@ -19,6 +43,12 @@ impl<T: Debug> Debug for Queue<T> {
 }
 
 impl<T> Queue<T> {
+    /// Creates a new queue with the specified mode.
+    ///
+    /// # Arguments
+    ///
+    /// * `mode` - The `QueueMode` (FIFO or LIFO) that determines the queue's behavior.
+    ///
     pub fn new(mode: QueueMode) -> Queue<T> {
         let state = SharedState::new(mode);
         Queue {
@@ -26,6 +56,11 @@ impl<T> Queue<T> {
         }
     }
 
+    /// Initiates a shutdown of the queue.
+    ///
+    /// This sets the shutdown flag to true and notifies all threads that are currently
+    /// waiting on the condvar in `pop_blocking` or `pop_timeout`. Once shutdown,
+    /// no more items can be pushed to the queue.
     pub fn shutdown(&self) {
         self.shared
             .shutdown
@@ -33,6 +68,19 @@ impl<T> Queue<T> {
         self.shared.condvar.notify_all();
     }
 
+    /// Tries to push an item onto the queue.
+    ///
+    /// If the queue has been shut down, this method will fail and return the item
+    /// it was trying to push.
+    ///
+    /// # Arguments
+    ///
+    /// * `item` - The item to push onto the queue.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - If the item was successfully pushed.
+    /// * `Err(T)` - If the queue is shut down, containing the item that was not pushed.
     pub fn try_push(&self, item: T) -> Result<(), T> {
         if !self
             .shared
@@ -47,17 +95,47 @@ impl<T> Queue<T> {
         Err(item)
     }
 
+    /// Pushes an item onto the queue.
+    ///
+    /// This method will panic if the queue has been shut down. For a non-panicking
+    /// version, see `try_push`.
+    ///
+    /// # Arguments
+    ///
+    /// * `item` - The item to push onto the queue.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the queue is shut down.
     pub fn push(&self, item: T) {
         if let Err(_item_we_dont_need_to_print) = self.try_push(item) {
             panic!("Tried to push to a shut down queue");
         }
     }
 
+    /// Removes and returns an item from the queue.
+    ///
+    /// This is a non-blocking operation. The item is removed according to the queue's
+    /// `QueueMode` (FIFO or LIFO).
+    ///
+    /// # Returns
+    ///
+    /// * `Some(T)` - If there was an item to pop.
+    /// * `None` - If the queue was empty.
     pub fn pop(&self) -> Option<T> {
         let mut guard = self.shared.inner.lock().unwrap();
         guard.pop()
     }
 
+    /// Removes and returns an item from the queue, blocking until an item is available.
+    ///
+    /// This method will block the current thread until an item is pushed to the queue
+    /// or the queue is shut down.
+    ///
+    /// # Returns
+    ///
+    /// * `Some(T)` - If an item was successfully popped.
+    /// * `None` - If the queue is empty and has been shut down.
     pub fn pop_blocking(&self) -> Option<T> {
         let guard = self.shared.inner.lock().unwrap();
         let mut guard = self
@@ -74,6 +152,19 @@ impl<T> Queue<T> {
         guard.pop()
     }
 
+    /// Removes and returns an item from the queue, blocking until an item is available or a timeout is reached.
+    ///
+    /// This method will block the current thread until an item is pushed, the timeout
+    /// elapses, or the queue is shut down.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - The maximum `Duration` to wait for an item.
+    ///
+    /// # Returns
+    ///
+    /// * `Some(T)` - If an item was successfully popped.
+    /// * `None` - If the timeout was reached or if the queue is empty and has been shut down.
     pub fn pop_timeout(&self, timeout: std::time::Duration) -> Option<T> {
         let guard = self.shared.inner.lock().unwrap();
         let (mut guard, _) = self
@@ -91,16 +182,26 @@ impl<T> Queue<T> {
         guard.pop()
     }
 
+    /// Returns the number of items currently in the queue.
     pub fn len(&self) -> usize {
         let guard = self.shared.inner.lock().unwrap();
         guard.data.len()
     }
 
+    /// Returns `true` if the queue contains no items.
     pub fn is_empty(&self) -> bool {
         let guard = self.shared.inner.lock().unwrap();
         guard.data.is_empty()
     }
 
+    /// Peeks at the next item in the queue without removing it.
+    ///
+    /// Applies a closure to a reference to the item that would be returned by `pop`.
+    ///
+    /// # Returns
+    ///
+    /// * `Some(R)` - If the queue is not empty, containing the return value of the closure.
+    /// * `None` - If the queue is empty.
     pub fn peek<R, F>(&self, f: F) -> Option<R>
     where
         F: FnOnce(&T) -> R,
@@ -109,13 +210,17 @@ impl<T> Queue<T> {
         guard.peek().map(f)
     }
 
+    /// Removes all items from the queue.
     pub fn clear(&self) {
         let mut guard = self.shared.inner.lock().unwrap();
         guard.data.clear();
     }
 }
+/// Specifies the operational mode of the queue.
 pub enum QueueMode {
+    /// First-In, First-Out. Items are removed in the same order they are added.
     FIFO,
+    /// Last-In, First-Out. The most recently added item is the first one to be removed.
     LIFO,
 }
 struct InnerQueue<T> {
@@ -147,7 +252,6 @@ impl<T> InnerQueue<T> {
             QueueMode::LIFO => self.data.front(),
         }
     }
-
 }
 
 struct SharedState<T> {
@@ -207,7 +311,7 @@ mod tests {
         let value = lifo.peek(|v| *v).unwrap();
         assert_eq!(value, 10);
 
-        let fifo: Queue<usize> = Queue::new(QueueMode::LIFO);
+        let fifo: Queue<usize> = Queue::new(QueueMode::FIFO);
         fifo.push(5);
 
         let fifo_value = fifo.peek(|v| *v).unwrap();
