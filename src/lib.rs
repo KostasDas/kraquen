@@ -37,7 +37,7 @@ impl<T> Queue<T> {
         if !self
             .shared
             .shutdown
-            .load(std::sync::atomic::Ordering::SeqCst) 
+            .load(std::sync::atomic::Ordering::SeqCst)
         {
             let mut guard = self.shared.inner.lock().unwrap();
             guard.push(item);
@@ -53,20 +53,25 @@ impl<T> Queue<T> {
         }
     }
 
-
     pub fn pop(&self) -> Option<T> {
         let mut guard = self.shared.inner.lock().unwrap();
         guard.pop()
     }
 
-    pub fn pop_blocking(&self) -> T {
+    pub fn pop_blocking(&self) -> Option<T> {
         let guard = self.shared.inner.lock().unwrap();
         let mut guard = self
             .shared
             .condvar
-            .wait_while(guard, |inner| inner.data.is_empty())
+            .wait_while(guard, |inner| {
+                inner.data.is_empty()
+                    && !self
+                        .shared
+                        .shutdown
+                        .load(std::sync::atomic::Ordering::SeqCst)
+            })
             .unwrap();
-        guard.pop().unwrap()
+        guard.pop()
     }
 
     pub fn pop_timeout(&self, timeout: std::time::Duration) -> Option<T> {
@@ -74,7 +79,13 @@ impl<T> Queue<T> {
         let (mut guard, _) = self
             .shared
             .condvar
-            .wait_timeout_while(guard, timeout, |inner| inner.data.is_empty())
+            .wait_timeout_while(guard, timeout, |queue| {
+                queue.data.is_empty()
+                    && !self
+                        .shared
+                        .shutdown
+                        .load(std::sync::atomic::Ordering::SeqCst)
+            })
             .unwrap();
 
         guard.pop()
@@ -136,6 +147,7 @@ impl<T> InnerQueue<T> {
             QueueMode::LIFO => self.data.front(),
         }
     }
+
 }
 
 struct SharedState<T> {
@@ -265,7 +277,7 @@ mod tests {
         queue.push(5);
 
         let value = handle.join().unwrap();
-        assert_eq!(value, 5);
+        assert_eq!(value, Some(5));
     }
     #[test]
     fn test_pop_timeout() {
