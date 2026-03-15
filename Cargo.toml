@@ -2,5 +2,13 @@
 name = "kraquen"
 version = "0.1.0"
 edition = "2024"
+description = "A fast, thread-safe, and highly ergonomic generic queue with dual modes and bounded eviction."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/KostasDas/kraquen"
+readme = "README.md"
+
+keywords = ["queue", "concurrency", "fifo", "lifo", "ring-buffer"]
+
+categories = ["concurrency", "data-structures"]
 
 [dependencies]
