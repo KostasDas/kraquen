@@ -50,7 +50,45 @@ impl<T> Queue<T> {
     /// * `mode` - The `QueueMode` (FIFO or LIFO) that determines the queue's behavior.
     ///
     pub fn new(mode: QueueMode) -> Queue<T> {
-        let state = SharedState::new(mode);
+        let state = SharedState::new(mode, None);
+        Queue {
+            shared: Arc::new(state),
+        }
+    }
+    /// Creates a new queue with the specified mode and a maximum capacity.
+    ///
+    /// This creates a bounded queue. If the queue reaches the specified `capacity`,
+    /// pushing new items will not block. Instead, it will forcefully evict the
+    /// next scheduled item (based on the `QueueMode`) to make room, and return it.
+    ///
+    /// * In `FIFO` mode, pushing to a full queue evicts the **oldest** item.
+    /// * In `LIFO` mode, pushing to a full queue evicts the **newest** item.
+    ///
+    /// # Arguments
+    ///
+    /// * `mode` - The `QueueMode` (FIFO or LIFO) that determines the queue's behavior.
+    /// * `capacity` - The maximum number of items the queue can hold.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kraquen::{Queue, QueueMode};
+    ///
+    /// // Create a bounded FIFO queue that holds a maximum of 2 items
+    /// let queue = Queue::with_capacity(QueueMode::FIFO, 2);
+    ///
+    /// assert_eq!(queue.push(10), None); // Plenty of room
+    /// assert_eq!(queue.push(20), None); // Queue is now full: [10, 20]
+    ///
+    /// // Pushing a 3rd item evicts the oldest item (10)
+    /// let evicted = queue.push(30);
+    /// assert_eq!(evicted, Some(10));
+    ///
+    /// // The queue now contains [20, 30]
+    /// assert_eq!(queue.pop(), Some(20));
+    /// ```
+    pub fn with_capacity(mode: QueueMode, capacity: usize) -> Queue<T> {
+        let state = SharedState::new(mode, Some(capacity));
         Queue {
             shared: Arc::new(state),
         }
@@ -79,18 +117,18 @@ impl<T> Queue<T> {
     ///
     /// # Returns
     ///
-    /// * `Ok(())` - If the item was successfully pushed.
+    /// * `Ok(Option<T>)` - If the item was successfully pushed. Optionally returns an evicted item T for bound capacity queues
     /// * `Err(T)` - If the queue is shut down, containing the item that was not pushed.
-    pub fn try_push(&self, item: T) -> Result<(), T> {
+    pub fn try_push(&self, item: T) -> Result<Option<T>, T> {
         if !self
             .shared
             .shutdown
             .load(std::sync::atomic::Ordering::SeqCst)
         {
             let mut guard = self.shared.inner.lock().unwrap();
-            guard.push(item);
+            let evicted = guard.push(item);
             self.shared.condvar.notify_one();
-            return Ok(());
+            return Ok(evicted);
         }
         Err(item)
     }
@@ -107,9 +145,13 @@ impl<T> Queue<T> {
     /// # Panics
     ///
     /// Panics if the queue is shut down.
-    pub fn push(&self, item: T) {
-        if let Err(_item_we_dont_need_to_print) = self.try_push(item) {
-            panic!("Tried to push to a shut down queue");
+    /// # Returns
+    ///
+    /// * `Option<T>` - An evicted item T for bound capacity queues
+    pub fn push(&self, item: T) -> Option<T> {
+        match self.try_push(item) {
+            Ok(evicted) => evicted,
+            Err(_) => panic!("Tried to push to a shut down queue"),
         }
     }
 
@@ -226,17 +268,24 @@ pub enum QueueMode {
 struct InnerQueue<T> {
     mode: QueueMode,
     data: VecDeque<T>,
+    capacity: Option<usize>,
 }
 
 impl<T> InnerQueue<T> {
-    fn new(mode: QueueMode) -> InnerQueue<T> {
+    fn new(mode: QueueMode, capacity: Option<usize>) -> InnerQueue<T> {
         InnerQueue {
             mode,
             data: VecDeque::new(),
+            capacity,
         }
     }
-    pub fn push(&mut self, item: T) {
-        self.data.push_front(item)
+    pub fn push(&mut self, item: T) -> Option<T> {
+        let evicted = match self.capacity {
+            Some(cap) if self.data.len() >= cap => self.pop(),
+            _ => None,
+        };
+        self.data.push_front(item);
+        evicted
     }
 
     pub fn pop(&mut self) -> Option<T> {
@@ -261,9 +310,9 @@ struct SharedState<T> {
 }
 
 impl<T> SharedState<T> {
-    pub fn new(mode: QueueMode) -> Self {
+    pub fn new(mode: QueueMode, capacity: Option<usize>) -> Self {
         SharedState {
-            inner: Mutex::new(InnerQueue::new(mode)),
+            inner: Mutex::new(InnerQueue::new(mode, capacity)),
             condvar: Condvar::new(),
             shutdown: AtomicBool::new(false),
         }
@@ -439,5 +488,42 @@ mod tests {
         let result = queue.peek(|v| *v);
 
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_bounded_capacity_eviction_fifo() {
+        let queue = Queue::with_capacity(QueueMode::FIFO, 2);
+
+        // Push first two items (plenty of room, returns None)
+        assert_eq!(queue.push(1), None);
+        assert_eq!(queue.push(2), None);
+
+        // Queue is now full [1, 2].
+        // Pushing a 3rd item should evict the oldest item (1)
+        let evicted = queue.push(3);
+        assert_eq!(evicted, Some(1));
+
+        // Queue should now contain [2, 3]
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.pop(), Some(2));
+        assert_eq!(queue.pop(), Some(3));
+    }
+
+    #[test]
+    fn test_bounded_capacity_eviction_lifo() {
+        let queue = Queue::with_capacity(QueueMode::LIFO, 2);
+
+        assert_eq!(queue.push(1), None);
+        assert_eq!(queue.push(2), None);
+
+        // Queue is LIFO, so the "newest" item at the front is 2.
+        // Pushing 3 should evict the 2!
+        let evicted = queue.push(3);
+        assert_eq!(evicted, Some(2));
+
+        // Queue should now contain [3, 1]
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.pop(), Some(3));
+        assert_eq!(queue.pop(), Some(1));
     }
 }
