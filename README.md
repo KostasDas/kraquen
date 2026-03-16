@@ -6,12 +6,12 @@ Kraquen is designed for concurrent applications where you need reliable communic
 
 ## Key Features
 
-* **Thread-Safe by Default:** Already wrapped in `Arc` `Mutex`
+* **Thread-Safe by Default:** Internal Arc-Mutex architecture allows effortless cloning across threads.
 * **Dual Modes:** Support for both standard FIFO pipelines and LIFO stack patterns.
-* **Bounded Eviction (Ring Buffer):** Cap the maximum size of your queue. If full, new pushes seamlessly evict old data instead of deadlocking your producer threads.
-* **Ergonomic Retrievals:** Choose between non-blocking (`pop`), blocking (`pop_blocking`), and timed blocking (`pop_timeout`) retrievals.
-* **Graceful Shutdown:** Safely close the queue to prevent new pushes while allowing consumers to drain the remaining items.
-* **Zero-Copy Peeking:** Inspect the next item in line using a closure without removing it.
+* **Bounded Eviction (Ring Buffer):** Cap your queue size. If full, new pushes evict old data to keep producers moving.
+* **Telemetry & Observability:** Get real-time snapshots of traffic, drops, and worker starvation.
+* **Graceful Shutdown:** Notify consumers to drain remaining work while blocking new inputs.
+* **Zero-Copy Peeking:** Inspect items via closure without triggering a pop.
 
 ---
 
@@ -113,6 +113,22 @@ match queue.try_push(1) {
     Err(returned_item) => println!("Queue closed. Item {} was returned.", returned_item),
 }
 ```
+---
+
+## Observability (Telemetry)
+
+Kraquen provides a "dashboard" for your queue via the `snapshot()` method. This returns a frozen moment in time of the queue's internal counters.
+
+```rust
+let queue = Queue::with_capacity(QueueMode::FIFO, 100);
+
+// Later, in a monitoring thread or log...
+let stats = queue.snapshot();
+
+println!("Queue Depth: {}", stats.current_len);
+println!("Items Pushed: {}", stats.total_pushed);
+println!("Items Dropped: {}", stats.total_evicted);
+println!("Idle Workers: {}", stats.waiting_consumers);
 
 ---
 
@@ -132,3 +148,4 @@ match queue.try_push(1) {
 | `is_empty()` | Returns `true` if the queue has zero items. |
 | `clear()` | Removes all items from the queue. |
 | `shutdown()` | Closes the queue to new pushes and wakes all waiting threads. |
+| `snapshot()` | Returns a snapshot of the queue's internal counters. |

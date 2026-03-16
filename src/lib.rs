@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::fmt::{Debug, Formatter};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 /// A thread-safe, generic queue that can operate in either FIFO (First-In, First-Out)
@@ -128,6 +128,16 @@ impl<T> Queue<T> {
             let mut guard = self.shared.inner.lock().unwrap();
             let evicted = guard.push(item);
             self.shared.condvar.notify_one();
+            self.shared
+                .telemetry
+                .total_pushed
+                .fetch_add(1, Ordering::Relaxed);
+            if evicted.is_some() {
+                self.shared
+                    .telemetry
+                    .total_evicted
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             return Ok(evicted);
         }
         Err(item)
@@ -166,7 +176,14 @@ impl<T> Queue<T> {
     /// * `None` - If the queue was empty.
     pub fn pop(&self) -> Option<T> {
         let mut guard = self.shared.inner.lock().unwrap();
-        guard.pop()
+        let ret = guard.pop();
+        if ret.is_some() {
+            self.shared
+                .telemetry
+                .total_popped
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        ret
     }
 
     /// Removes and returns an item from the queue, blocking until an item is available.
@@ -179,6 +196,10 @@ impl<T> Queue<T> {
     /// * `Some(T)` - If an item was successfully popped.
     /// * `None` - If the queue is empty and has been shut down.
     pub fn pop_blocking(&self) -> Option<T> {
+        self.shared
+            .telemetry
+            .waiting_consumers
+            .fetch_add(1, Ordering::Relaxed);
         let guard = self.shared.inner.lock().unwrap();
         let mut guard = self
             .shared
@@ -191,7 +212,18 @@ impl<T> Queue<T> {
                         .load(std::sync::atomic::Ordering::SeqCst)
             })
             .unwrap();
-        guard.pop()
+        self.shared
+            .telemetry
+            .waiting_consumers
+            .fetch_sub(1, Ordering::Relaxed);
+        let ret = guard.pop();
+        if ret.is_some() {
+            self.shared
+                .telemetry
+                .total_popped
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        ret
     }
 
     /// Removes and returns an item from the queue, blocking until an item is available or a timeout is reached.
@@ -208,6 +240,10 @@ impl<T> Queue<T> {
     /// * `Some(T)` - If an item was successfully popped.
     /// * `None` - If the timeout was reached or if the queue is empty and has been shut down.
     pub fn pop_timeout(&self, timeout: std::time::Duration) -> Option<T> {
+        self.shared
+            .telemetry
+            .waiting_consumers
+            .fetch_add(1, Ordering::Relaxed);
         let guard = self.shared.inner.lock().unwrap();
         let (mut guard, _) = self
             .shared
@@ -220,8 +256,18 @@ impl<T> Queue<T> {
                         .load(std::sync::atomic::Ordering::SeqCst)
             })
             .unwrap();
-
-        guard.pop()
+        self.shared
+            .telemetry
+            .waiting_consumers
+            .fetch_sub(1, Ordering::Relaxed);
+        let ret = guard.pop();
+        if ret.is_some() {
+            self.shared
+                .telemetry
+                .total_popped
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        ret
     }
 
     /// Returns the number of items currently in the queue.
@@ -256,6 +302,21 @@ impl<T> Queue<T> {
     pub fn clear(&self) {
         let mut guard = self.shared.inner.lock().unwrap();
         guard.data.clear();
+    }
+
+    /// Returns a snapshot of the current queue metrics.
+    ///
+    /// This provides insight into the queue's health, including total traffic,
+    /// eviction counts, and the number of currently waiting consumers.
+    pub fn snapshot(&self) -> QueueSnapshot {
+        let tel = &self.shared.telemetry;
+        QueueSnapshot {
+            current_len: self.len(),
+            total_pushed: tel.total_pushed.load(Ordering::Relaxed),
+            total_popped: tel.total_popped.load(Ordering::Relaxed),
+            total_evicted: tel.total_evicted.load(Ordering::Relaxed),
+            waiting_consumers: tel.waiting_consumers.load(Ordering::Relaxed),
+        }
     }
 }
 /// Specifies the operational mode of the queue.
@@ -307,6 +368,7 @@ struct SharedState<T> {
     inner: Mutex<InnerQueue<T>>,
     condvar: Condvar,
     shutdown: AtomicBool,
+    telemetry: Telemetry,
 }
 
 impl<T> SharedState<T> {
@@ -315,6 +377,34 @@ impl<T> SharedState<T> {
             inner: Mutex::new(InnerQueue::new(mode, capacity)),
             condvar: Condvar::new(),
             shutdown: AtomicBool::new(false),
+            telemetry: Telemetry::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueSnapshot {
+    pub current_len: usize,
+    pub total_pushed: usize,
+    pub total_popped: usize,
+    pub total_evicted: usize,
+    pub waiting_consumers: usize,
+}
+
+struct Telemetry {
+    total_pushed: AtomicUsize,
+    total_popped: AtomicUsize,
+    total_evicted: AtomicUsize,
+    waiting_consumers: AtomicUsize,
+}
+
+impl Telemetry {
+    fn new() -> Self {
+        Telemetry {
+            total_pushed: AtomicUsize::new(0),
+            total_popped: AtomicUsize::new(0),
+            total_evicted: AtomicUsize::new(0),
+            waiting_consumers: AtomicUsize::new(0),
         }
     }
 }
@@ -525,5 +615,23 @@ mod tests {
         assert_eq!(queue.len(), 2);
         assert_eq!(queue.pop(), Some(3));
         assert_eq!(queue.pop(), Some(1));
+    }
+
+    #[test]
+    fn test_telemetry_snapshot() {
+        let queue = Queue::with_capacity(QueueMode::FIFO, 2);
+
+        queue.push(1);
+        queue.push(2);
+        queue.push(3); // This triggers an eviction
+        queue.pop(); // One successful pop
+
+        let stats = queue.snapshot();
+
+        assert_eq!(stats.total_pushed, 3);
+        assert_eq!(stats.total_evicted, 1);
+        assert_eq!(stats.total_popped, 1);
+        assert_eq!(stats.current_len, 1);
+        assert_eq!(stats.waiting_consumers, 0);
     }
 }
