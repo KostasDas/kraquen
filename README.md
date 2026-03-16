@@ -129,6 +129,7 @@ println!("Queue Depth: {}", stats.current_len);
 println!("Items Pushed: {}", stats.total_pushed);
 println!("Items Dropped: {}", stats.total_evicted);
 println!("Idle Workers: {}", stats.waiting_consumers);
+```
 
 ---
 
